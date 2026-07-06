@@ -1,0 +1,1 @@
+-r ../local-bg-remover/requirements.txt
