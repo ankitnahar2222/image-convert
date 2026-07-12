@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageStat, UnidentifiedImageError
 from rembg import remove
 
 
@@ -56,6 +56,11 @@ MAX_IMAGE_PIXELS = env_int("BG_REMOVER_MAX_IMAGE_PIXELS", 20_000_000)
 RATE_LIMIT_WINDOW_SECONDS = env_int("BG_REMOVER_RATE_LIMIT_WINDOW_SECONDS", 60)
 RATE_LIMIT_MAX_REQUESTS = env_int("BG_REMOVER_RATE_LIMIT_MAX_REQUESTS", 20)
 RATE_LIMIT_ENABLED = os.getenv("BG_REMOVER_RATE_LIMIT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+PHOTO_ENHANCEMENT_ENABLED = os.getenv("PHOTO_ENHANCEMENT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+PHOTO_ENHANCEMENT_DEFAULT = os.getenv("PHOTO_ENHANCEMENT_DEFAULT", "auto").strip().lower()
+PHOTO_ENHANCEMENT_MAX_BRIGHTNESS = env_int("PHOTO_ENHANCEMENT_MAX_BRIGHTNESS", 22, 0)
+PHOTO_ENHANCEMENT_MAX_CONTRAST = env_int("PHOTO_ENHANCEMENT_MAX_CONTRAST", 14, 0)
+PHOTO_ENHANCEMENT_MAX_SHARPNESS = env_int("PHOTO_ENHANCEMENT_MAX_SHARPNESS", 12, 0)
 
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
@@ -172,6 +177,7 @@ def rate_limit_allow(client_ip: str, now: float):
 class RemoveBackgroundRequest(BaseModel):
     imageBase64: str
     background: str = "white"
+    autoEnhance: bool | None = None
 
 
 class DeleteCloudinaryAssetRequest(BaseModel):
@@ -202,6 +208,14 @@ def log_startup_config():
         RATE_LIMIT_WINDOW_SECONDS,
     )
     logger.info(
+        "Photo enhancement: enabled=%s, default=%s, max_brightness=%s, max_contrast=%s, max_sharpness=%s",
+        PHOTO_ENHANCEMENT_ENABLED,
+        PHOTO_ENHANCEMENT_DEFAULT,
+        PHOTO_ENHANCEMENT_MAX_BRIGHTNESS,
+        PHOTO_ENHANCEMENT_MAX_CONTRAST,
+        PHOTO_ENHANCEMENT_MAX_SHARPNESS,
+    )
+    logger.info(
         "Photo retention policy: uploaded source photos are processed in memory only; Cloudinary processed image deletion after client display confirmation is enabled=%s.",
         cloudinary_delete_enabled(),
     )
@@ -215,11 +229,12 @@ async def remove_background(fastapi_request: Request):
     started_at = time.perf_counter()
     request = await parse_remove_background_request(fastapi_request, request_id)
     logger.info(
-        "[%s] /remove-background started: content_type=%s image_base64_chars=%s background=%s",
+        "[%s] /remove-background started: content_type=%s image_base64_chars=%s background=%s auto_enhance=%s",
         request_id,
         fastapi_request.headers.get("content-type", "unknown"),
         len(request.imageBase64),
         request.background,
+        request.autoEnhance,
     )
 
     source_bytes = decode_image_base64(request.imageBase64, request_id)
@@ -268,14 +283,19 @@ async def remove_background(fastapi_request: Request):
     logger.info("[%s] Image trimmed to subject: dimensions=%sx%s", request_id, transparent.width, transparent.height)
     white_canvas = Image.new("RGBA", transparent.size, (255, 255, 255, 255))
     white_canvas.alpha_composite(transparent)
+    final_image = white_canvas.convert("RGB")
+    if should_auto_enhance(request):
+        final_image = enhance_photo(final_image, transparent.getchannel("A"), request_id)
+    else:
+        logger.info("[%s] Photo enhancement skipped: enabled=%s requested=%s", request_id, PHOTO_ENHANCEMENT_ENABLED, request.autoEnhance)
 
     output = io.BytesIO()
-    white_canvas.convert("RGB").save(output, format="JPEG", quality=98)
+    final_image.save(output, format="JPEG", quality=98)
     logger.info(
         "[%s] Prepared image encoded: dimensions=%sx%s, bytes=%s",
         request_id,
-        white_canvas.width,
-        white_canvas.height,
+        final_image.width,
+        final_image.height,
         output.tell(),
     )
 
@@ -294,6 +314,7 @@ async def parse_remove_background_request(request: Request, request_id: str):
     content_type = request.headers.get("content-type", "").lower()
     image_base64 = None
     background = "white"
+    auto_enhance = None
 
     if "application/json" in content_type or not content_type:
         try:
@@ -308,6 +329,7 @@ async def parse_remove_background_request(request: Request, request_id: str):
 
         image_base64, image_field = get_first_string(payload, "imageBase64", "image_base64", "base64Image", "image", "photo")
         background = str(payload.get("background") or "white")
+        auto_enhance = parse_optional_bool(payload.get("autoEnhance", payload.get("auto_enhance")))
         logger.info("[%s] Parsed JSON /remove-background payload using field=%s", request_id, image_field or "missing")
     elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
         try:
@@ -318,6 +340,7 @@ async def parse_remove_background_request(request: Request, request_id: str):
 
         image_base64, image_field = get_first_string(form, "imageBase64", "image_base64", "base64Image")
         background = str(form.get("background") or "white")
+        auto_enhance = parse_optional_bool(form.get("autoEnhance", form.get("auto_enhance")))
 
         if not image_base64:
             for file_field in ("file", "image", "photo"):
@@ -338,7 +361,7 @@ async def parse_remove_background_request(request: Request, request_id: str):
         logger.warning("[%s] /remove-background missing imageBase64. content_type=%s", request_id, content_type or "missing")
         raise HTTPException(status_code=400, detail="imageBase64 is required. Send JSON as {\"imageBase64\":\"...\"}.")
 
-    return RemoveBackgroundRequest(imageBase64=image_base64, background=background)
+    return RemoveBackgroundRequest(imageBase64=image_base64, background=background, autoEnhance=auto_enhance)
 
 
 def get_first_string(mapping, *keys: str):
@@ -347,6 +370,64 @@ def get_first_string(mapping, *keys: str):
         if isinstance(value, str) and value.strip():
             return value, key
     return None, None
+
+
+def parse_optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def should_auto_enhance(request: RemoveBackgroundRequest):
+    if not PHOTO_ENHANCEMENT_ENABLED:
+        return False
+    if request.autoEnhance is not None:
+        return request.autoEnhance
+    return PHOTO_ENHANCEMENT_DEFAULT in {"1", "true", "yes", "on", "auto"}
+
+
+def enhance_photo(image: Image.Image, alpha_mask: Image.Image, request_id: str):
+    rgb = image.convert("RGB")
+    subject_mask = alpha_mask.point(lambda value: 255 if value > 16 else 0)
+    if not subject_mask.getbbox():
+        logger.info("[%s] Photo enhancement skipped: no foreground mask available", request_id)
+        return rgb
+
+    stat = ImageStat.Stat(rgb, subject_mask)
+    mean_luma = sum(stat.mean) / 3
+    brightness_delta = max(0, min(PHOTO_ENHANCEMENT_MAX_BRIGHTNESS, int((178 - mean_luma) / 3.8)))
+    contrast_delta = max(0, min(PHOTO_ENHANCEMENT_MAX_CONTRAST, int((152 - min(stat.stddev)) / 9)))
+    sharpness_delta = PHOTO_ENHANCEMENT_MAX_SHARPNESS if min(image.size) >= 480 else max(0, PHOTO_ENHANCEMENT_MAX_SHARPNESS // 2)
+
+    brightness_factor = 1 + (brightness_delta / 100)
+    contrast_factor = 1 + (contrast_delta / 100)
+    sharpness_factor = 1 + (sharpness_delta / 100)
+
+    enhanced = rgb
+    if brightness_delta:
+        enhanced = ImageEnhance.Brightness(enhanced).enhance(brightness_factor)
+    if contrast_delta:
+        enhanced = ImageEnhance.Contrast(enhanced).enhance(contrast_factor)
+    if sharpness_delta:
+        enhanced = ImageEnhance.Sharpness(enhanced).enhance(sharpness_factor)
+    final_image = Image.composite(enhanced, rgb, subject_mask)
+
+    logger.info(
+        "[%s] Photo enhancement applied to foreground: mean_luma=%.2f brightness_factor=%.3f contrast_factor=%.3f sharpness_factor=%.3f",
+        request_id,
+        mean_luma,
+        brightness_factor,
+        contrast_factor,
+        sharpness_factor,
+    )
+    return final_image
 
 
 def decode_image_base64(image_base64: str, request_id: str):
